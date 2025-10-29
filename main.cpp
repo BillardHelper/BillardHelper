@@ -1,197 +1,210 @@
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <vector>
+#include <cmath>
+
 using namespace std;
+using namespace cv;
 
-cv::Mat img, hsvImage;
-vector<cv::Point> tableCorners;
-
-// Step 1
-bool loadAndConvertImage(const string &filename)
+// ------------------------------------------------------------
+// 조명(밝기) 보정: HSV V 채널 equalizeHist
+// ------------------------------------------------------------
+static Mat LightingNormalizeHSV(const Mat &srcBGR)
 {
-    img = cv::imread(filename);
-    if (img.empty())
-        return false;
-    cv::cvtColor(img, hsvImage, cv::COLOR_BGR2HSV);
-    return true;
-}
-
-// Step 2
-void maskTableArea()
-{
-    cv::Scalar lowerGreen(115, 180, 160), upperGreen(123, 255, 255);
-    // cv::Scalar lowerBlue(110, 100, 100), upperBlue(130, 255, 255);
-    cv::Mat mask;
-    cv::inRange(hsvImage, lowerGreen, upperGreen, mask);
-    cv::erode(mask, mask, {}, {-1, -1}, 2);
-    cv::dilate(mask, mask, {}, {-1, -1}, 2);
-    cv::imwrite("step2_table_mask.jpg", mask);
-}
-
-// Step 3
-void extractTableCorners(const cv::Mat &binaryMask, cv::Mat &visualOutput)
-{
-    vector<vector<cv::Point>> contours;
-    vector<cv::Point> approx, hull;
-    cv::findContours(binaryMask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-    double maxArea = 0.0;
-    int maxIdx = -1;
-    for (int i = 0; i < contours.size(); ++i)
+    if (srcBGR.empty() || srcBGR.type() != CV_8UC3)
     {
-        double area = cv::contourArea(contours[i]);
-        if (area > maxArea)
+        cerr << "[LightingNormalizeHSV] invalid input image" << endl;
+        return srcBGR.clone();
+    }
+
+    Mat hsv;
+    cvtColor(srcBGR, hsv, COLOR_BGR2HSV);
+
+    vector<Mat> ch;
+    split(hsv, ch); // ch[0]=H, ch[1]=S, ch[2]=V
+
+    equalizeHist(ch[2], ch[2]); // 밝기 균일화
+
+    Mat hsv_eq;
+    merge(ch, hsv_eq);
+
+    Mat outBGR;
+    cvtColor(hsv_eq, outBGR, COLOR_HSV2BGR);
+
+    return outBGR;
+}
+
+// ------------------------------------------------------------
+// 테이블(파란 천) 마스크 만들기
+//    - 파란 천 Hue 범위로 inRange
+//    - Morphology로 다듬고
+//    - 약간 dilate해서 쿠션 경계까지 포함
+//    반환: mask (CV_8UC1, 0 또는 255)
+// ------------------------------------------------------------
+static Mat MakeTableMask(const Mat &srcBGR)
+{
+    // 1. BGR -> HSV
+    Mat hsv;
+    cvtColor(srcBGR, hsv, COLOR_BGR2HSV);
+
+    // 2. 파란 당구대 천만 먼저 threshold
+    Scalar lowerBlue(90, 80, 60);    // H,S,V 최소
+    Scalar upperBlue(140, 255, 255); // H,S,V 최대
+    Mat maskBlue;
+    inRange(hsv, lowerBlue, upperBlue, maskBlue);
+
+    // 3. 노이즈 제거 (close -> open)
+    Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+    morphologyEx(maskBlue, maskBlue, MORPH_CLOSE, kernel);
+    morphologyEx(maskBlue, maskBlue, MORPH_OPEN, kernel);
+
+    // ---------------------------
+    // (A) 테이블 "윤곽 전체" 마스크 만들기
+    // ---------------------------
+    // 아이디어:
+    //  - maskBlue에서 가장 큰 컨투어(=당구대 영역) 찾기
+    //  - 컨투어를 근사 다각형(거의 사각형)으로 만들고
+    //  - 다각형으로 꽉 채운 마스크를 tableHullMask로 쓴다
+    //
+    // 이렇게 만든 tableHullMask는
+    //  "테이블 내부 전체"만 255인 마스크가 된다.
+    // ---------------------------
+
+    // 컨투어 탐색 준비
+    vector<vector<Point>> contours;
+    vector<Vec4i> hierarchy;
+    findContours(maskBlue, contours, hierarchy, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+    Mat tableHullMask = Mat::zeros(maskBlue.size(), CV_8UC1);
+
+    if (!contours.empty())
+    {
+        // 가장 큰 컨투어 선택 (면적 최대)
+        size_t bestIdx = 0;
+        double bestArea = 0.0;
+        for (size_t i = 0; i < contours.size(); ++i)
         {
-            maxArea = area;
-            maxIdx = i;
+            double area = contourArea(contours[i]);
+            if (area > bestArea)
+            {
+                bestArea = area;
+                bestIdx = i;
+            }
         }
-    }
-    if (maxIdx == -1)
-        return;
 
-    cv::approxPolyDP(contours[maxIdx], approx, 20, true);
-    cv::convexHull(approx, hull);
-    tableCorners = hull;
+        // 선택된 컨투어 근사(사각형 비슷하게) -> 테이블 전체 영역 얻기
+        vector<Point> poly;
+        approxPolyDP(contours[bestIdx], poly, 10.0, true);
+        // poly가 4점 근처일 가능성이 높음 (테이블 사각형 투시된 형태)
 
-    visualOutput = img.clone();
-    for (size_t i = 0; i < hull.size(); ++i)
-    {
-        cv::circle(visualOutput, hull[i], 8, cv::Scalar(0, 0, 255), -1);
-        cv::putText(visualOutput, to_string(i), hull[i] + cv::Point(5, -5),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+        // poly 로 채운 마스크 생성
+        vector<vector<Point>> fillMe;
+        fillMe.push_back(poly);
+        fillPoly(tableHullMask, fillMe, Scalar(255));
     }
-    cv::drawContours(visualOutput, contours, maxIdx, cv::Scalar(255, 0, 0), 2);
-    cv::imwrite("step3_corners.jpg", visualOutput);
+
+    // tableHullMask 가 이제 "테이블 전체" 영역 (255=테이블 내부)
+
+    // ---------------------------
+    // 파란 천 마스크를 팽창해서 공까지 포함
+    // ---------------------------
+    Mat maskDilated;
+    dilate(maskBlue, maskDilated, kernel, Point(-1, -1), 2);
+    // 여기서 maskDilated는 바깥으로도 조금 새어나갈 수 있음
+
+    // ---------------------------
+    // 최종 마스크 = (팽창된 마스크) AND (테이블 전체 영역)
+    // ---------------------------
+    Mat finalMask;
+    bitwise_and(maskDilated, tableHullMask, finalMask);
+
+    // finalMask:
+    // - 테이블 영역 밖은 절대 0 (tableHullMask 덕분)
+    // - 테이블 안은 원래 파란 천 + 약간 확장 (공 포함)
+
+    return finalMask;
 }
 
-// Step 4-1: 일반 HSV + Hough 방식 (흰색/노란색 공용)
-vector<cv::Point> findBallCenters_HSV_Hough(cv::Scalar lower, cv::Scalar upper, const string &colorName)
+/*
+// dilate 세부 조정 필요(위 코드로 해결)
+static Mat MakeTableMask(const Mat &srcBGR)
 {
-    vector<cv::Point> centers;
+    Mat hsv;
+    cvtColor(srcBGR, hsv, COLOR_BGR2HSV);
 
-    cv::Mat mask, masked;
-    cv::inRange(hsvImage, lower, upper, mask);
-    cv::bitwise_and(img, img, masked, mask);
+    // 파란 당구대 천 범위 (넉넉하게 설정)
+    Scalar lowerBlue(90, 80, 60);    // H,S,V 최소
+    Scalar upperBlue(140, 255, 255); // H,S,V 최대
 
-    cv::imwrite("debug_mask_" + colorName + ".jpg", mask);
-    cv::imwrite("debug_masked_" + colorName + ".jpg", masked);
+    Mat maskBlue;
+    inRange(hsv, lowerBlue, upperBlue, maskBlue);
 
-    cv::Mat gray;
-    cv::cvtColor(masked, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, gray, cv::Size(9, 9), 2);
+    // 잡티 제거 & 구멍 메우기
+    Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+    morphologyEx(maskBlue, maskBlue, MORPH_CLOSE, kernel);
+    morphologyEx(maskBlue, maskBlue, MORPH_OPEN, kernel);
 
-    vector<cv::Vec3f> circles;
-    cv::HoughCircles(gray, circles, cv::HOUGH_GRADIENT, 1,
-                     20, 100, 20, 10, 30);
+    // 테이블 경계(쿠션 부분)까지 조금 더 포함시키고 싶으면 팽창(dilate), 팽창 안하면, 영역안에 공이 안잡힘, 팽창 하면 공은 잡히는데 당구대 영역이 좀 더 커짐
+    // dilate(maskBlue, maskBlue, kernel, Point(-1, -1), 2);
 
-    for (const auto &c : circles)
-    {
-        cv::Point center(cvRound(c[0]), cvRound(c[1]));
-        int radius = cvRound(c[2]);
-        centers.push_back(center);
-        cout << "[Hough] " << colorName << " ball center: (" << center.x << ", " << center.y << "), r=" << radius << endl;
-    }
-
-    return centers;
+    return maskBlue;
 }
+*/
 
-// Step 4-2: 빨간 공 전용 (Hue 0~10 + 170~180)
-vector<cv::Point> findBallCenters_HSV_Hough_Red(const string &colorName)
+// ------------------------------------------------------------
+// 최종 합성
+//    - tableMask 영역 안: 원본(조명 보정된) 색 유지 (파란 천 + 공 색 전부 그대로)
+//    - tableMask 영역 밖: (0,0,0)
+// ------------------------------------------------------------
+static Mat KeepOnlyInsideTable(const Mat &srcBGR, const Mat &tableMask)
 {
-    vector<cv::Point> centers;
-
-    cv::Mat mask1, mask2, mask, masked;
-    cv::inRange(hsvImage, cv::Scalar(0, 70, 70), cv::Scalar(10, 255, 255), mask1);
-    cv::inRange(hsvImage, cv::Scalar(170, 70, 70), cv::Scalar(180, 255, 255), mask2);
-    cv::bitwise_or(mask1, mask2, mask);
-
-    cv::bitwise_and(img, img, masked, mask);
-    cv::imwrite("debug_mask_" + colorName + ".jpg", mask);
-    cv::imwrite("debug_masked_" + colorName + ".jpg", masked);
-
-    cv::Mat gray;
-    cv::cvtColor(masked, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, gray, cv::Size(9, 9), 2);
-
-    vector<cv::Vec3f> circles;
-    cv::HoughCircles(gray, circles, cv::HOUGH_GRADIENT, 1,
-                     20, 100, 20, 10, 30);
-
-    for (const auto &c : circles)
-    {
-        cv::Point center(cvRound(c[0]), cvRound(c[1]));
-        int radius = cvRound(c[2]);
-        centers.push_back(center);
-        cout << "[Hough] " << colorName << " ball center: (" << center.x << ", " << center.y << "), r=" << radius << endl;
-    }
-
-    return centers;
+    Mat result = Mat::zeros(srcBGR.size(), srcBGR.type());
+    srcBGR.copyTo(result, tableMask); // 마스크가 0이 아닌 영역만 복사
+    return result;
 }
 
-// 픽셀 → mm 변환
-cv::Point2f convertToMM(const cv::Point &p, const vector<cv::Point> &corners)
-{
-    if (corners.size() != 4)
-        return {-1, -1};
-    float w_mm = 2448.0f, h_mm = 1224.0f;
-    float w_px = cv::norm(corners[0] - corners[1]);
-    float h_px = cv::norm(corners[0] - corners[3]);
-    float scaleX = w_mm / w_px;
-    float scaleY = h_mm / h_px;
-    float dx = static_cast<float>(p.x - corners[0].x);
-    float dy = static_cast<float>(p.y - corners[0].y);
-    return {dx * scaleX, dy * scaleY};
-}
-
-// 시각화
-void drawBallCenters(const vector<cv::Point> &centers, const cv::Scalar &color, const string &label, cv::Mat &output)
-{
-    for (size_t i = 0; i < centers.size(); ++i)
-    {
-        cv::circle(output, centers[i], 10, color, 2);
-        cv::putText(output, label + to_string(i + 1), centers[i] + cv::Point(5, -5),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
-    }
-}
-
+// ------------------------------------------------------------
 // main
-int main()
+// ------------------------------------------------------------
+int main(void)
 {
-    if (!loadAndConvertImage("BilliardImage.jpg"))
+    Mat img = imread("test_img2.jpg", IMREAD_COLOR);
+    if (img.empty())
     {
-        cerr << "Image load failed." << endl;
-        return -1;
+        cerr << "Failed to load image: " << endl;
+        return 1;
     }
 
-    maskTableArea();
-
-    cv::Mat step2Mask = cv::imread("step2_table_mask.jpg", cv::IMREAD_GRAYSCALE);
-    if (step2Mask.empty())
-        return -1;
-
-    cv::Mat step3Output;
-    extractTableCorners(step2Mask, step3Output);
-
-    // 공 인식 (Red: 두 Hue 범위 합침)
-    auto redCenters = findBallCenters_HSV_Hough_Red("red");
-    auto whiteCenters = findBallCenters_HSV_Hough(cv::Scalar(0, 0, 180), cv::Scalar(180, 60, 255), "white");
-    auto orangeCenters = findBallCenters_HSV_Hough(cv::Scalar(20, 100, 150), cv::Scalar(35, 255, 255), "orange");
-
-    for (const auto &pt : redCenters)
+    // 리사이즈(원본 너무 커서 보기 힘듦..)
+    int targetHeight = 1000;
+    if (img.rows > targetHeight)
     {
-        cv::Point2f mm = convertToMM(pt, tableCorners);
-        cout << "Red ball mm pos: (" << mm.x << ", " << mm.y << ")" << endl;
+        double scale = static_cast<double>(targetHeight) / img.rows;
+        resize(img, img, Size(), scale, scale);
+        cout << "[Info] resized to " << img.cols << " x " << img.rows << endl;
     }
 
-    // 결과 시각화
-    cv::Mat step4Output = img.clone();
-    drawBallCenters(redCenters, cv::Scalar(0, 0, 255), "R", step4Output);
-    drawBallCenters(whiteCenters, cv::Scalar(255, 255, 255), "W", step4Output);
-    drawBallCenters(orangeCenters, cv::Scalar(0, 165, 255), "O", step4Output);
+    // (2) 조명 보정 (밝기 평활화)
+    Mat img_norm = LightingNormalizeHSV(img);
 
-    cv::imshow("Step 4 - Ball Centers", step4Output);
-    cv::imwrite("step4_result.jpg", step4Output);
+    // (3) 테이블 마스크 생성 (파란 천 기반)
+    Mat tableMask = MakeTableMask(img_norm);
 
-    cv::waitKey(0);
+    // (4) 마스크 안은 모두 살리고 (천 + 공), 마스크 밖은 0으로
+    Mat tableAndBallsOnly = KeepOnlyInsideTable(img_norm, tableMask);
+
+    imshow("Original", img);
+    imshow("LightingNormalized", img_norm);
+    imshow("TableMask", tableMask); // 흰 부분이 테이블로 인식된 영역
+    imshow("TableAndBallsOnly", tableAndBallsOnly);
+
+    // 결과 영상 저장
+    imwrite("LightingNormalized.png", img_norm);
+    imwrite("TableMask.png", tableMask);
+    imwrite("TableAndBallsOnly.png", tableAndBallsOnly);
+
+    waitKey(0);
+    destroyAllWindows();
+
     return 0;
 }
