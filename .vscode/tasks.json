@@ -1,0 +1,54 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build (pkg-config, OpenCV)",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "set -e; mkdir -p build; SRC=$(ls src/*.cpp 2>/dev/null || echo main.cpp); g++ $SRC -o build/main $(pkg-config --cflags --libs opencv4) -std=c++17 -O2 -Wall -Wextra"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Run (build/main)",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "./build/main"
+            ],
+            "dependsOn": [
+                "Build (pkg-config, OpenCV)"
+            ]
+        },
+        {
+            "label": "CMake: Configure (optional)",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: Build (optional)",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "cmake --build build -j"
+            ],
+            "problemMatcher": [],
+            "dependsOn": [
+                "CMake: Configure (optional)"
+            ]
+        }
+    ]
+}
