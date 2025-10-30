@@ -78,6 +78,7 @@ int main() {
     return 1;
   }
 
+  // 4개 포인트 입력 받기
   // vector<Point> selectedPoints = getFourPoints(image);
   vector<Point> selectedPoints = {
       {265, 506}, {497, 511}, {716, 947}, {10, 937}};
@@ -87,14 +88,43 @@ int main() {
     return 1;
   }
 
+  // 호모그래피 변환
   const float outputWidth = boardWidth * scaleFactor;
   const float outputHeight = boardHeight * scaleFactor;
   Mat transformedImage;
   changeHomography(image, transformedImage, selectedPoints,
                    Size(outputWidth, outputHeight));
 
-  imshow("Homography Transformed", transformedImage);
+  // k-means (k=4)
+  Mat image_32f;
+  transformedImage.convertTo(image_32f, CV_32F);
 
+  Mat samples(transformedImage.rows * transformedImage.cols, 3, CV_32F);
+  samples = image_32f.reshape(1, transformedImage.rows * transformedImage.cols);
+
+  const int K = 4;
+  Mat labels, centers;
+
+  TermCriteria criteria(TermCriteria::MAX_ITER | TermCriteria::EPS, 100, 1.0);
+
+  kmeans(samples, K, labels, criteria, 500, KMEANS_PP_CENTERS, centers);
+
+  Mat resultImage(transformedImage.size(), transformedImage.type());
+  for (int y = 0; y < transformedImage.rows; y++)
+    for (int x = 0; x < transformedImage.cols; x++) {
+      int clusterIndex = labels.at<int>(y * transformedImage.cols + x);
+
+      float b = centers.at<float>(clusterIndex, 0);
+      float g = centers.at<float>(clusterIndex, 1);
+      float rValue = centers.at<float>(clusterIndex, 2);
+
+      resultImage.at<Vec3b>(y, x) =
+          Vec3b(static_cast<uchar>(b), static_cast<uchar>(g),
+                static_cast<uchar>(rValue));
+    }
+
+  // imshow("Homography Transformed", transformedImage);
+  imshow("K-Means Result", resultImage);
   char key = waitKey(1);
   while (!(key == 'q' || key == 'Q'))
     key = waitKey(1);  // Q키 입력 들어올 때까지 무한 대기
