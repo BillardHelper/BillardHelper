@@ -93,8 +93,18 @@ int main() {
   changeHomography(image, transformedImage, selectedPoints,
                    Size(outputWidth, outputHeight));
 
-  imshow("Homography Transformed", transformedImage);
+  // channel wise mean substract
+  Scalar avg = mean(transformedImage);
 
+  Mat subs = transformedImage - avg;
+  Mat graySubs;
+  cvtColor(subs, graySubs, COLOR_BGR2GRAY);
+
+  Mat result;
+  threshold(graySubs, result, 30.0, 255.0, THRESH_BINARY);
+
+  imshow("Homography Transformed", transformedImage);
+  imshow("result", result);
   char key = waitKey(1);
   while (!(key == 'q' || key == 'Q'))
     key = waitKey(1);  // Q키 입력 들어올 때까지 무한 대기
