@@ -21,7 +21,7 @@ vector<Point> getFourPoints(const Mat& inputImage) {
   vector<Point> points;
   Mat tempImage;
   const string windowName =
-      "네 꼭짓점 클릭(가로로 긴 테이블 기준, 왼쪽 위부터 CW 방향, Q로 종료)";
+      "네 꼭짓점 클릭(세로로 긴 테이블 기준, 왼쪽 위부터 CW 방향, Q로 종료)";
 
   namedWindow(windowName);
   setMouseCallback(windowName, onMouse, &points);
@@ -67,7 +67,10 @@ void changeHomography(const Mat& src, Mat& dst, const vector<Point>& points,
 }
 
 int main() {
-  const float scaleFactor = 0.5f;
+  const float scaleFactor = 0.3f;
+  const float boardWidth = 1'442.5f;
+  const float boardHeight = 2'845.0f;
+  const float ballDiameter = 61.5f;
 
   Mat image = imread("../resource/20251008_181035 (중형).jpg");
   if (image.empty()) {
@@ -77,20 +80,23 @@ int main() {
 
   // vector<Point> selectedPoints = getFourPoints(image);
   vector<Point> selectedPoints = {
-      {52, 914}, {272, 510}, {488, 515}, {678, 924}};
+      {265, 506}, {497, 511}, {716, 947}, {10, 937}};
 
   if (selectedPoints.size() != 4) {
     cout << "모든 포인트 입력을 받지 않고 종료." << endl;
     return 1;
   }
 
-  const float outputWidth = 2448.0f * scaleFactor;
-  const float outputHeight = 1224.0f * scaleFactor;
+  const float outputWidth = boardWidth * scaleFactor;
+  const float outputHeight = boardHeight * scaleFactor;
   Mat transformedImage;
   changeHomography(image, transformedImage, selectedPoints,
                    Size(outputWidth, outputHeight));
 
   imshow("Homography Transformed", transformedImage);
-  waitKey(0);
+
+  char key = waitKey(1);
+  while (!(key == 'q' || key == 'Q'))
+    key = waitKey(1);  // Q키 입력 들어올 때까지 무한 대기
   return 0;
 }

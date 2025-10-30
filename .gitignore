@@ -1,0 +1,17 @@
+build/
+[Bb]uild/
+
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.o
+*.obj
+
+.DS_Store
+
+.vscode/
+.vs/
+*.sln
+*.vcxproj*
