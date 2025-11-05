@@ -35,12 +35,86 @@ static Mat LightingNormalizeHSV(const Mat &srcBGR)
 }
 
 // ------------------------------------------------------------
+// 테이블 내부 전체를 255로 만드는 마스크 생성 함수 (수정본)
+//  - 파란 천 HSV로 "윤곽"만 추출
+//  - 최대 컨투어 -> 근사 다각형/볼록껍질 -> 내부를 통째로 채움
+//  - 필요 시 border_shrink_px로 살짝 erode하여 경계 누수 방지
+// ------------------------------------------------------------
+static Mat MakeTableMask(const Mat &srcBGR, int border_shrink_px = 0)
+{
+    // 1) BGR -> HSV
+    Mat hsv;
+    cvtColor(srcBGR, hsv, COLOR_BGR2HSV);
+
+    // 2) 파란 천 범위 (환경에 맞게 S/V 조정 가능)
+    Scalar lowerBlue(90, 80, 60);
+    Scalar upperBlue(140, 255, 255);
+    Mat maskBlue;
+    inRange(hsv, lowerBlue, upperBlue, maskBlue);
+
+    // 3) 노이즈 제거 (close -> open)
+    Mat k5 = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+    morphologyEx(maskBlue, maskBlue, MORPH_CLOSE, k5);
+    morphologyEx(maskBlue, maskBlue, MORPH_OPEN, k5);
+
+    // 4) 최대 컨투어 찾기
+    vector<vector<Point>> contours;
+    findContours(maskBlue, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+    Mat tableMask = Mat::zeros(maskBlue.size(), CV_8UC1);
+    if (contours.empty())
+        return tableMask; // 비어 있으면 그대로 반환
+
+    size_t bestIdx = 0;
+    double bestArea = 0.0;
+    for (size_t i = 0; i < contours.size(); ++i)
+    {
+        double a = contourArea(contours[i]);
+        if (a > bestArea)
+        {
+            bestArea = a;
+            bestIdx = i;
+        }
+    }
+
+    // 5) 근사 다각형 + 볼록껍질로 안정화
+    vector<Point> approx;
+    double peri = arcLength(contours[bestIdx], true);
+    approxPolyDP(contours[bestIdx], approx, 0.02 * peri, true);
+
+    // 근사 결과가 불안정하면 볼록껍질로 대체
+    if (approx.size() < 3)
+        approx = contours[bestIdx];
+
+    vector<Point> hull;
+    convexHull(approx, hull);
+
+    if (hull.size() >= 3)
+    {
+        const vector<vector<Point>> fillMe{hull};
+        fillPoly(tableMask, fillMe, Scalar(255));
+    }
+
+    // 6) 경계가 살짝 새면 안쪽으로 줄이기(옵션)
+    if (border_shrink_px > 0)
+    {
+        Mat k = getStructuringElement(MORPH_ELLIPSE,
+                                      Size(2 * border_shrink_px + 1, 2 * border_shrink_px + 1));
+        erode(tableMask, tableMask, k, Point(-1, -1), 1);
+    }
+
+    // 결과: 테이블 내부는 전부 255, 외부는 0
+    return tableMask;
+}
+
+// ------------------------------------------------------------
 // 테이블(파란 천) 마스크 만들기
 //    - 파란 천 Hue 범위로 inRange
 //    - Morphology로 다듬고
 //    - 약간 dilate해서 쿠션 경계까지 포함
 //    반환: mask (CV_8UC1, 0 또는 255)
 // ------------------------------------------------------------
+/*
 static Mat MakeTableMask(const Mat &srcBGR)
 {
     // 1. BGR -> HSV
@@ -123,7 +197,7 @@ static Mat MakeTableMask(const Mat &srcBGR)
     // - 테이블 안은 원래 파란 천 + 약간 확장 (공 포함)
 
     return finalMask;
-}
+}*/
 
 /*
 // dilate 세부 조정 필요(위 코드로 해결)
