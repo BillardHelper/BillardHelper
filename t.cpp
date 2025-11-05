@@ -174,7 +174,7 @@ static bool detectTableInnerCorners(const Mat &bgr, vector<Point2f> &corners, Ma
 }
 
 // ================================
-// 함수: HSV 범위로 공의 중심점을 찾음
+// 함수: HSV 범위로 공의 중심점을 찾음 (질문자가 준 코드 확장)
 //  - 빨강(2구역) 처리 가능
 //  - 너무 작은 잡음 제거, 모폴로지 정제
 // ================================
@@ -344,10 +344,10 @@ static BallResult processBilliardFrame(
 int main()
 {
     // 1) 원본 이미지 로드
-    Mat src = imread("Test1_TableAndBallsOnly.png");
+    Mat src = imread("1619.png");
     if (src.empty())
     {
-        cerr << "[Error] 이미지 로드 실패" << endl;
+        cerr << "[Error] 이미지 로드 실패: 1619.png" << endl;
         return -1;
     }
 
