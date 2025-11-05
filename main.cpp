@@ -1,70 +1,133 @@
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <vector>
+#include <algorithm>
+#include <string>
 #include <cmath>
 
 using namespace std;
 using namespace cv;
 
-// ------------------------------------------------------------
-// 조명(밝기) 보정: HSV V 채널 equalizeHist
-// ------------------------------------------------------------
-static Mat LightingNormalizeHSV(const Mat &srcBGR)
+// ================================
+// 표준 규격 상수 (mm 단위)
+// ================================
+static constexpr double kTABLE_WIDTH_MM = 2540.0;  // "긴 변" (국제식 캐롬 플레이영역 가로)
+static constexpr double kTABLE_HEIGHT_MM = 1270.0; // "짧은 변" (국제식 캐롬 플레이영역 세로)
+static constexpr double kBALL_DIAMETER_MM = 61.5;  // 표준 당구공 지름
+static constexpr double kBALL_RADIUS_MM = kBALL_DIAMETER_MM * 0.5;
+
+// ================================
+// 유틸: 점 4개를 TL, TR, BL, BR 순서로 정렬
+// ================================
+static vector<Point2f> orderCornersTLTRBLBR(const vector<Point2f> &pts)
 {
-    if (srcBGR.empty() || srcBGR.type() != CV_8UC3)
+    CV_Assert(pts.size() == 4);
+    vector<Point2f> out(4);
+
+    // 중심점
+    Point2f c(0, 0);
+    for (auto &p : pts)
+        c += p;
+    c *= (1.0f / 4.0f);
+
+    // 대략적 사분면 분류
+    // 0:TL, 1:TR, 2:BL, 3:BR
+    auto quad = [&](const Point2f &p)
     {
-        cerr << "[LightingNormalizeHSV] invalid input image" << endl;
-        return srcBGR.clone();
+        int qx = (p.x < c.x) ? 0 : 1;
+        int qy = (p.y < c.y) ? 0 : 2;
+        return qx + qy;
+    };
+
+    // 초기 배치
+    for (auto &p : pts)
+    {
+        int q = quad(p);
+        if (q == 0)
+            out[0] = p;
+        else if (q == 1)
+            out[1] = p;
+        else if (q == 2)
+            out[2] = p;
+        else
+            out[3] = p;
     }
 
-    Mat hsv;
-    cvtColor(srcBGR, hsv, COLOR_BGR2HSV);
+    // 보정: x+y 최소=TL, 최대=BR
+    auto sumCmp = [](const Point2f &a, const Point2f &b)
+    { return (a.x + a.y) < (b.x + b.y); };
+    Point2f tl = *min_element(pts.begin(), pts.end(), sumCmp);
+    Point2f br = *max_element(pts.begin(), pts.end(), sumCmp);
 
-    vector<Mat> ch;
-    split(hsv, ch); // ch[0]=H, ch[1]=S, ch[2]=V
+    // 나머지 두 점을 TR/BL로 배치
+    vector<Point2f> rest;
+    for (auto &p : pts)
+        if (p != tl && p != br)
+            rest.push_back(p);
+    Point2f tr, bl;
+    if (rest.size() == 2)
+    {
+        if (rest[0].x > rest[1].x)
+        {
+            tr = rest[0];
+            bl = rest[1];
+        }
+        else
+        {
+            tr = rest[1];
+            bl = rest[0];
+        }
+    }
+    else
+    {
+        // fallback
+        tr = out[1];
+        bl = out[2];
+    }
 
-    equalizeHist(ch[2], ch[2]); // 밝기 균일화
-
-    Mat hsv_eq;
-    merge(ch, hsv_eq);
-
-    Mat outBGR;
-    cvtColor(hsv_eq, outBGR, COLOR_HSV2BGR);
-
-    return outBGR;
+    out[0] = tl;
+    out[1] = tr;
+    out[2] = bl;
+    out[3] = br;
+    return out;
 }
 
-// ------------------------------------------------------------
-// 테이블 내부 전체를 255로 만드는 마스크 생성 함수 (수정본)
-//  - 파란 천 HSV로 "윤곽"만 추출
-//  - 최대 컨투어 -> 근사 다각형/볼록껍질 -> 내부를 통째로 채움
-//  - 필요 시 border_shrink_px로 살짝 erode하여 경계 누수 방지
-// ------------------------------------------------------------
-static Mat MakeTableMask(const Mat &srcBGR, int border_shrink_px = 0)
+// ================================
+// 파란 천 마스크 (윤곽 추출용)
+// ================================
+static Mat makeBlueTableMask(const Mat &bgr)
 {
-    // 1) BGR -> HSV
     Mat hsv;
-    cvtColor(srcBGR, hsv, COLOR_BGR2HSV);
+    cvtColor(bgr, hsv, COLOR_BGR2HSV);
 
-    // 2) 파란 천 범위 (환경에 맞게 S/V 조정 가능)
+    // 파란 천 범위(환경에 맞게 조정)
     Scalar lowerBlue(90, 80, 60);
     Scalar upperBlue(140, 255, 255);
-    Mat maskBlue;
-    inRange(hsv, lowerBlue, upperBlue, maskBlue);
 
-    // 3) 노이즈 제거 (close -> open)
-    Mat k5 = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
-    morphologyEx(maskBlue, maskBlue, MORPH_CLOSE, k5);
-    morphologyEx(maskBlue, maskBlue, MORPH_OPEN, k5);
+    Mat mask;
+    inRange(hsv, lowerBlue, upperBlue, mask);
 
-    // 4) 최대 컨투어 찾기
+    Mat k = getStructuringElement(MORPH_ELLIPSE, Size(7, 7));
+    morphologyEx(mask, mask, MORPH_CLOSE, k, Point(-1, -1), 2);
+    morphologyEx(mask, mask, MORPH_OPEN, k, Point(-1, -1), 1);
+    return mask;
+}
+
+// ================================
+// 당구대 내측 4꼭짓점 자동 검출 (TL,TR,BL,BR)
+// ================================
+static bool detectTableInnerCorners(const Mat &bgr, vector<Point2f> &corners, Mat *dbgMask = nullptr)
+{
+    Mat mask = makeBlueTableMask(bgr);
+    if (dbgMask)
+        *dbgMask = mask.clone();
+
     vector<vector<Point>> contours;
-    findContours(maskBlue, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-
-    Mat tableMask = Mat::zeros(maskBlue.size(), CV_8UC1);
+    findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
     if (contours.empty())
-        return tableMask; // 비어 있으면 그대로 반환
+        return false;
 
+    // 가장 큰 컨투어
     size_t bestIdx = 0;
     double bestArea = 0.0;
     for (size_t i = 0; i < contours.size(); ++i)
@@ -77,208 +140,229 @@ static Mat MakeTableMask(const Mat &srcBGR, int border_shrink_px = 0)
         }
     }
 
-    // 5) 근사 다각형 + 볼록껍질로 안정화
+    // 다각형 근사
     vector<Point> approx;
     double peri = arcLength(contours[bestIdx], true);
     approxPolyDP(contours[bestIdx], approx, 0.02 * peri, true);
 
-    // 근사 결과가 불안정하면 볼록껍질로 대체
-    if (approx.size() < 3)
-        approx = contours[bestIdx];
-
-    vector<Point> hull;
-    convexHull(approx, hull);
-
-    if (hull.size() >= 3)
+    vector<Point2f> pts;
+    if (approx.size() == 4)
     {
-        const vector<vector<Point>> fillMe{hull};
-        fillPoly(tableMask, fillMe, Scalar(255));
+        for (auto &p : approx)
+            pts.emplace_back((float)p.x, (float)p.y);
+    }
+    else
+    {
+        RotatedRect rr = minAreaRect(contours[bestIdx]);
+        Point2f rrPts[4];
+        rr.points(rrPts);
+        for (int i = 0; i < 4; ++i)
+            pts.push_back(rrPts[i]);
     }
 
-    // 6) 경계가 살짝 새면 안쪽으로 줄이기(옵션)
-    if (border_shrink_px > 0)
-    {
-        Mat k = getStructuringElement(MORPH_ELLIPSE,
-                                      Size(2 * border_shrink_px + 1, 2 * border_shrink_px + 1));
-        erode(tableMask, tableMask, k, Point(-1, -1), 1);
-    }
-
-    // 결과: 테이블 내부는 전부 255, 외부는 0
-    return tableMask;
+    corners = orderCornersTLTRBLBR(pts);
+    return true;
 }
 
-// ------------------------------------------------------------
-// 테이블(파란 천) 마스크 만들기
-//    - 파란 천 Hue 범위로 inRange
-//    - Morphology로 다듬고
-//    - 약간 dilate해서 쿠션 경계까지 포함
-//    반환: mask (CV_8UC1, 0 또는 255)
-// ------------------------------------------------------------
-/*
-static Mat MakeTableMask(const Mat &srcBGR)
+// ================================
+// HSV 범위로 공 중심 검출
+// ================================
+static vector<Point2f> findBallCenters(
+    const Mat &hsv_image,
+    const Scalar &lower1, const Scalar &upper1,
+    const Scalar &lower2 = Scalar(-1, -1, -1), const Scalar &upper2 = Scalar(-1, -1, -1),
+    int minArea = 100, int erodeIter = 1, int dilateIter = 3)
 {
-    // 1. BGR -> HSV
-    Mat hsv;
-    cvtColor(srcBGR, hsv, COLOR_BGR2HSV);
+    Mat mask1, mask2, mask;
+    inRange(hsv_image, lower1, upper1, mask1);
+    if (lower2[0] != -1)
+    {
+        inRange(hsv_image, lower2, upper2, mask2);
+        bitwise_or(mask1, mask2, mask);
+    }
+    else
+    {
+        mask = mask1;
+    }
 
-    // 2. 파란 당구대 천만 먼저 threshold
-    Scalar lowerBlue(90, 80, 60);    // H,S,V 최소
-    Scalar upperBlue(140, 255, 255); // H,S,V 최대
-    Mat maskBlue;
-    inRange(hsv, lowerBlue, upperBlue, maskBlue);
+    erode(mask, mask, Mat(), Point(-1, -1), erodeIter);
+    dilate(mask, mask, Mat(), Point(-1, -1), dilateIter);
 
-    // 3. 노이즈 제거 (close -> open)
-    Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
-    morphologyEx(maskBlue, maskBlue, MORPH_CLOSE, kernel);
-    morphologyEx(maskBlue, maskBlue, MORPH_OPEN, kernel);
-
-    // ---------------------------
-    // (A) 테이블 "윤곽 전체" 마스크 만들기
-    // ---------------------------
-    // 아이디어:
-    //  - maskBlue에서 가장 큰 컨투어(=당구대 영역) 찾기
-    //  - 컨투어를 근사 다각형(거의 사각형)으로 만들고
-    //  - 다각형으로 꽉 채운 마스크를 tableHullMask로 쓴다
-    //
-    // 이렇게 만든 tableHullMask는
-    //  "테이블 내부 전체"만 255인 마스크가 된다.
-    // ---------------------------
-
-    // 컨투어 탐색 준비
     vector<vector<Point>> contours;
-    vector<Vec4i> hierarchy;
-    findContours(maskBlue, contours, hierarchy, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+    findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
 
-    Mat tableHullMask = Mat::zeros(maskBlue.size(), CV_8UC1);
-
-    if (!contours.empty())
+    vector<Point2f> centers;
+    for (const auto &c : contours)
     {
-        // 가장 큰 컨투어 선택 (면적 최대)
-        size_t bestIdx = 0;
-        double bestArea = 0.0;
-        for (size_t i = 0; i < contours.size(); ++i)
-        {
-            double area = contourArea(contours[i]);
-            if (area > bestArea)
-            {
-                bestArea = area;
-                bestIdx = i;
-            }
-        }
+        if (contourArea(c) < minArea)
+            continue;
+        Moments m = moments(c, true);
+        if (m.m00 > 0.0)
+            centers.emplace_back((float)(m.m10 / m.m00), (float)(m.m01 / m.m00));
+    }
+    return centers;
+}
 
-        // 선택된 컨투어 근사(사각형 비슷하게) -> 테이블 전체 영역 얻기
-        vector<Point> poly;
-        approxPolyDP(contours[bestIdx], poly, 10.0, true);
-        // poly가 4점 근처일 가능성이 높음 (테이블 사각형 투시된 형태)
+// ================================
+// 결과 구조체
+// ================================
+struct BallResult
+{
+    vector<Point2f> red;
+    vector<Point2f> yellow;
+    vector<Point2f> white;
+    Mat canvas; // 표준 스크린에 공이 그려진 결과
+};
 
-        // poly 로 채운 마스크 생성
-        vector<vector<Point>> fillMe;
-        fillMe.push_back(poly);
-        fillPoly(tableHullMask, fillMe, Scalar(255));
+// ================================
+// 전체 파이프라인
+//  - 방향(가로/세로) 자동 판정 포함
+// ================================
+static BallResult processBilliardFrame(
+    const Mat &bgr,
+    bool drawOutlines = true,
+    Mat *dbgMask = nullptr)
+{
+    BallResult res;
+
+    // 1) 4점 검출
+    vector<Point2f> corners;
+    if (!detectTableInnerCorners(bgr, corners, dbgMask))
+    {
+        cerr << "[Error] 당구대 4점 검출 실패" << endl;
+        return res;
     }
 
-    // tableHullMask 가 이제 "테이블 전체" 영역 (255=테이블 내부)
+    // 2) 방향(가로/세로) 판정
+    //    topLen: TL-TR, leftLen: TL-BL
+    double topLen = norm(corners[1] - corners[0]);
+    double leftLen = norm(corners[2] - corners[0]);
+    bool isTall = (leftLen > topLen); // 세로형(긴변↑)이면 true
 
-    // ---------------------------
-    // 파란 천 마스크를 팽창해서 공까지 포함
-    // ---------------------------
-    Mat maskDilated;
-    dilate(maskBlue, maskDilated, kernel, Point(-1, -1), 2);
-    // 여기서 maskDilated는 바깥으로도 조금 새어나갈 수 있음
+    // 3) 스크린 크기 및 물리 길이 매핑
+    int outW, outH;
+    double physX_mm, physY_mm; // x축 px이 대응하는 물리 길이, y축 px이 대응하는 물리 길이
+    if (!isTall)
+    {
+        // 가로형: 긴변이 x
+        outW = 1200;
+        outH = 600;
+        physX_mm = kTABLE_WIDTH_MM;  // 2840mm
+        physY_mm = kTABLE_HEIGHT_MM; // 1420mm
+    }
+    else
+    {
+        // 세로형: 긴변이 y
+        outW = 600;
+        outH = 1200;
+        physX_mm = kTABLE_HEIGHT_MM; // 1420mm (x는 짧은 변)
+        physY_mm = kTABLE_WIDTH_MM;  // 2840mm (y는 긴 변)
+    }
 
-    // ---------------------------
-    // 최종 마스크 = (팽창된 마스크) AND (테이블 전체 영역)
-    // ---------------------------
-    Mat finalMask;
-    bitwise_and(maskDilated, tableHullMask, finalMask);
+    // 4) Homography (순서 보존: TL→(0,0), TR→(W,0), BL→(0,H), BR→(W,H))
+    vector<Point2f> dstPts = {
+        {0.f, 0.f},
+        {(float)outW, 0.f},
+        {0.f, (float)outH},
+        {(float)outW, (float)outH}};
+    Mat H = findHomography(corners, dstPts);
+    if (H.empty())
+    {
+        cerr << "[Error] Homography 계산 실패" << endl;
+        return res;
+    }
 
-    // finalMask:
-    // - 테이블 영역 밖은 절대 0 (tableHullMask 덕분)
-    // - 테이블 안은 원래 파란 천 + 약간 확장 (공 포함)
-
-    return finalMask;
-}*/
-
-/*
-// dilate 세부 조정 필요(위 코드로 해결)
-static Mat MakeTableMask(const Mat &srcBGR)
-{
+    // 5) 공 중심 검출 (원본 좌표계)
     Mat hsv;
-    cvtColor(srcBGR, hsv, COLOR_BGR2HSV);
+    cvtColor(bgr, hsv, COLOR_BGR2HSV);
+    Scalar red_l1(0, 120, 70), red_u1(10, 255, 255);
+    Scalar red_l2(170, 120, 70), red_u2(179, 255, 255);
+    Scalar yellow_l(20, 100, 100), yellow_u(30, 255, 255);
+    Scalar white_l(0, 0, 180), white_u(179, 60, 255);
 
-    // 파란 당구대 천 범위 (넉넉하게 설정)
-    Scalar lowerBlue(90, 80, 60);    // H,S,V 최소
-    Scalar upperBlue(140, 255, 255); // H,S,V 최대
+    vector<Point2f> red_c = findBallCenters(hsv, red_l1, red_u1, red_l2, red_u2, 80);
+    vector<Point2f> yellow_c = findBallCenters(hsv, yellow_l, yellow_u, Scalar(-1, -1, -1), Scalar(-1, -1, -1), 80);
+    vector<Point2f> white_c = findBallCenters(hsv, white_l, white_u, Scalar(-1, -1, -1), Scalar(-1, -1, -1), 80);
 
-    Mat maskBlue;
-    inRange(hsv, lowerBlue, upperBlue, maskBlue);
+    // 6) 좌표를 정규 스크린 좌표계로 변환
+    vector<Point2f> red_t, yellow_t, white_t;
+    if (!red_c.empty())
+        perspectiveTransform(red_c, red_t, H);
+    if (!yellow_c.empty())
+        perspectiveTransform(yellow_c, yellow_t, H);
+    if (!white_c.empty())
+        perspectiveTransform(white_c, white_t, H);
 
-    // 잡티 제거 & 구멍 메우기
-    Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
-    morphologyEx(maskBlue, maskBlue, MORPH_CLOSE, kernel);
-    morphologyEx(maskBlue, maskBlue, MORPH_OPEN, kernel);
+    res.red = red_t;
+    res.yellow = yellow_t;
+    res.white = white_t;
 
-    // 테이블 경계(쿠션 부분)까지 조금 더 포함시키고 싶으면 팽창(dilate), 팽창 안하면, 영역안에 공이 안잡힘, 팽창 하면 공은 잡히는데 당구대 영역이 좀 더 커짐
-    // dilate(maskBlue, maskBlue, kernel, Point(-1, -1), 2);
+    // 7) mm → px 스케일(방향에 맞춰 정확 매핑)
+    const double px_per_mm_x = (double)outW / physX_mm;
+    const double px_per_mm_y = (double)outH / physY_mm;
+    const double px_per_mm = 0.5 * (px_per_mm_x + px_per_mm_y); // 평균 사용
+    const int ball_radius_px = (int)std::round(kBALL_RADIUS_MM * px_per_mm);
 
-    return maskBlue;
-}
-*/
+    // 8) 파란 배경 스크린 생성 및 공 그리기
+    Scalar feltColor(180, 120, 30); // BGR 청록/파랑 느낌
+    res.canvas = Mat(Size(outW, outH), CV_8UC3, feltColor);
 
-// ------------------------------------------------------------
-// 최종 합성
-//    - tableMask 영역 안: 원본(조명 보정된) 색 유지 (파란 천 + 공 색 전부 그대로)
-//    - tableMask 영역 밖: (0,0,0)
-// ------------------------------------------------------------
-static Mat KeepOnlyInsideTable(const Mat &srcBGR, const Mat &tableMask)
-{
-    Mat result = Mat::zeros(srcBGR.size(), srcBGR.type());
-    srcBGR.copyTo(result, tableMask); // 마스크가 0이 아닌 영역만 복사
-    return result;
-}
-
-// ------------------------------------------------------------
-// main
-// ------------------------------------------------------------
-int main(void)
-{
-    Mat img = imread("test_img1.jpg", IMREAD_COLOR);
-    if (img.empty())
+    auto drawBalls = [&](const vector<Point2f> &centers, const Scalar &bgrColor)
     {
-        cerr << "Failed to load image: " << endl;
-        return 1;
+        for (const auto &p : centers)
+        {
+            circle(res.canvas, p, ball_radius_px, bgrColor, FILLED, LINE_AA);
+            if (drawOutlines)
+                circle(res.canvas, p, ball_radius_px, Scalar(0, 0, 0), 2, LINE_AA);
+        }
+    };
+    drawBalls(res.red, Scalar(0, 0, 255));       // 빨강
+    drawBalls(res.yellow, Scalar(0, 255, 255));  // 노랑
+    drawBalls(res.white, Scalar(255, 255, 255)); // 흰색
+
+    return res;
+}
+
+// ================================
+// 데모용 main
+// ================================
+int main()
+{
+    // 원본 이미지: x가 짧은 변, y가 긴 변으로 찍힌 상태
+    Mat src = imread("TableAndBallsOnly.png");
+    if (src.empty())
+    {
+        cerr << "[Error] 이미지 로드 실패" << endl;
+        return -1;
     }
 
-    // 리사이즈(원본 너무 커서 보기 힘듦..)
-    int targetHeight = 1000;
-    if (img.rows > targetHeight)
+    Mat dbgMask;
+    BallResult result = processBilliardFrame(src,
+                                             /*drawOutlines=*/true,
+                                             /*dbgMask=*/&dbgMask);
+
+    auto printPoints = [](const string &name, const vector<Point2f> &v)
     {
-        double scale = static_cast<double>(targetHeight) / img.rows;
-        resize(img, img, Size(), scale, scale);
-        cout << "[Info] resized to " << img.cols << " x " << img.rows << endl;
+        cout << name << " (" << v.size() << "):\n";
+        for (size_t i = 0; i < v.size(); ++i)
+            cout << "  [" << i << "] (" << v[i].x << ", " << v[i].y << ")\n";
+    };
+    printPoints("Red", result.red);
+    printPoints("Yellow", result.yellow);
+    printPoints("White", result.white);
+
+    if (!result.canvas.empty())
+    {
+        imshow("Debug: Blue Table Mask", dbgMask);
+        imshow("Original", src);
+        imshow("Standard Screen (Balls Rendered)", result.canvas);
+        imwrite("standard_screen_result.png", result.canvas);
+        cout << "Saved: standard_screen_result.png\n";
+        waitKey(0);
     }
-
-    // (2) 조명 보정 (밝기 평활화)
-    Mat img_norm = LightingNormalizeHSV(img);
-
-    // (3) 테이블 마스크 생성 (파란 천 기반)
-    Mat tableMask = MakeTableMask(img_norm);
-
-    // (4) 마스크 안은 모두 살리고 (천 + 공), 마스크 밖은 0으로
-    Mat tableAndBallsOnly = KeepOnlyInsideTable(img_norm, tableMask);
-
-    imshow("Original", img);
-    imshow("LightingNormalized", img_norm);
-    imshow("TableMask", tableMask); // 흰 부분이 테이블로 인식된 영역
-    imshow("TableAndBallsOnly", tableAndBallsOnly);
-
-    // 결과 영상 저장
-    imwrite("LightingNormalized.png", img_norm);
-    imwrite("TableMask.png", tableMask);
-    imwrite("TableAndBallsOnly.png", tableAndBallsOnly);
-
-    waitKey(0);
-    destroyAllWindows();
-
+    else
+    {
+        cerr << "[Warn] 결과 캔버스가 비어 있음\n";
+    }
     return 0;
 }

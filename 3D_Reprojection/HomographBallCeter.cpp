@@ -344,7 +344,7 @@ static BallResult processBilliardFrame(
 int main()
 {
     // 1) 원본 이미지 로드
-    Mat src = imread("Test1_TableAndBallsOnly.png");
+    Mat src = imread("TableAndBallsOnly.png");
     if (src.empty())
     {
         cerr << "[Error] 이미지 로드 실패" << endl;
